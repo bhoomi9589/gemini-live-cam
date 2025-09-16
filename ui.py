@@ -9,7 +9,7 @@ import av
 import numpy as np
 import cv2
 
-API_URL = "http://localhost:5000"  # Flask backend URL
+API_URL = "https://gemini-live-cam.onrender.com"  # Flask backend URL
 
 
 def call_api(endpoint, method="GET", data=None, files=None):
