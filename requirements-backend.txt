@@ -1,0 +1,12 @@
+# Web Server & API
+Flask
+gunicorn
+
+# Core Gemini and Google Cloud
+google-genai
+python-dotenv
+
+# For image processing on the server
+opencv-python-headless
+numpy
+pillow
