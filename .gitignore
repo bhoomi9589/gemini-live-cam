@@ -1,1 +1,8 @@
 .env
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment folder (if you use one)
+venv/
+.venv/
