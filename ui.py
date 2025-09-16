@@ -3,26 +3,51 @@ import requests
 from PIL import Image
 import io
 import time
+# --- NEW IMPORTS ---
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+import av
+import numpy as np
+import cv2
 
 API_URL = "http://localhost:5000"  # Flask backend URL
 
 
-def call_api(endpoint, method="GET", data=None, stream=False):
+def call_api(endpoint, method="GET", data=None, files=None):
+    """Modified to handle file uploads."""
     try:
         url = f"{API_URL}{endpoint}"
         if method == "POST":
-            response = requests.post(url, json=data, stream=stream)
+            response = requests.post(url, json=data, files=files)
         else:
-            response = requests.get(url, stream=stream)
+            response = requests.get(url, stream=True if endpoint == "/frame" else False)
         
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response.raise_for_status()
         
-        if stream:
-            return response
-        return response.json()
+        # Handle different response types
+        if response.headers['Content-Type'] == 'application/json':
+            return response.json()
+        return response
     except requests.exceptions.RequestException as e:
-        return {"status": "error", "message": f"API connection error: {e}"}
+        st.error(f"API connection error: {e}")
+        return None
 
+# This callback function will be executed for each frame from the webcam
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    """Encodes each frame and sends it to the backend."""
+    img = frame.to_ndarray(format="bgr24")
+
+    _, buffer = cv2.imencode(".jpg", img)
+    jpeg_bytes = buffer.tobytes()
+
+    try:
+        # Send the frame to the backend's new endpoint
+        call_api("/upload_frame", method="POST", files={"frame": jpeg_bytes})
+    except Exception as e:
+        # Silently pass if the backend is busy, to not interrupt the stream
+        pass
+    
+    # Return the frame to display it in the Streamlit UI
+    return frame
 
 # -----------------------
 # Sidebar Controls
@@ -37,41 +62,40 @@ mode = st.sidebar.radio(
 
 if st.sidebar.button("▶️ Start Session"):
     res = call_api("/start", method="POST", data={"mode": mode})
-    if res.get("status") == "success":
+    if res and res.get("status") == "success":
         st.sidebar.success("✅ Session started successfully")
-    elif res.get("status") == "error" and "already running" in res.get("message", ""):
+    elif res and "already running" in res.get("message", ""):
         st.sidebar.warning("⚠️ Session is already running")
-    else:
+    elif res:
         st.sidebar.error(f"❌ {res.get('message', 'An unknown error occurred.')}")
     st.rerun()
 
 
 if st.sidebar.button("⏸️ Pause Session"):
     res = call_api("/pause", method="POST")
-    if res.get("status") == "success":
+    if res and res.get("status") == "success":
         st.sidebar.info("⏸️ Session paused")
-    else:
+    elif res:
         st.sidebar.error(f"❌ {res.get('message', 'An unknown error occurred.')}")
     st.rerun()
 
 
 if st.sidebar.button("▶️ Resume Session"):
     res = call_api("/resume", method="POST")
-    if res.get("status") == "success":
+    if res and res.get("status") == "success":
         st.sidebar.success("▶️ Session resumed")
-    else:
+    elif res:
         st.sidebar.error(f"❌ {res.get('message', 'An unknown error occurred.')}")
     st.rerun()
 
 
 if st.sidebar.button("🛑 Stop Session"):
     res = call_api("/stop", method="POST")
-    if res.get("status") == "success":
+    if res and res.get("status") == "success":
         st.sidebar.success("🛑 Session stopped")
-    else:
+    elif res:
         st.sidebar.error(f"❌ {res.get('message', 'An unknown error occurred.')}")
     st.rerun()
-
 
 # -----------------------
 # Custom Styling
@@ -87,14 +111,19 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+
 # -----------------------
 # Main UI
 # -----------------------
 st.title("🎥 Gemini Live UI")
 
 status_res = call_api("/status")
-status_value = status_res.get("status", "error")
-mode_value = status_res.get("mode", "none")
+if status_res:
+    status_value = status_res.get("status", "error")
+    mode_value = status_res.get("mode", "none")
+else:
+    status_value = "error"
+    mode_value = "N/A"
 
 status_class_map = {
     "running": "status-running",
@@ -110,30 +139,18 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Create a placeholder for the live video frame
-image_placeholder = st.empty()
-
-if status_value == "running" and mode_value in ["camera", "screen"]:
-    while True:
-        frame_response = call_api("/frame", method="GET", stream=True)
-        if isinstance(frame_response, dict) and frame_response.get("status") == "error":
-            st.error(f"Error fetching frame: {frame_response.get('message')}")
-            break
-        
-        if frame_response and hasattr(frame_response, 'status_code') and frame_response.status_code == 200:
-            try:
-                img = Image.open(io.BytesIO(frame_response.content))
-                # FIX: Replaced deprecated 'use_container_width' with 'width'
-                image_placeholder.image(img, caption="Live Feed", width='stretch')
-            except Exception as e:
-                st.error(f"Failed to decode image: {e}")
-                break
-        else:
-            st.warning("Waiting for video stream...")
-        
-        # Control the frame rate to reduce network load
-        time.sleep(0.05)
+if status_value == "running" and mode_value == "camera":
+    st.info("Webcam feed is active. Your camera data is being sent for processing.")
+    webrtc_streamer(
+        key="camera-stream",
+        mode=WebRtcMode.SENDONLY,
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 elif status_value == "stopped":
-    image_placeholder.info("Session is stopped. Start a new session to see the live feed.")
+    st.info("Session is stopped. Start a new session to see the live feed.")
 elif status_value == "paused":
-    image_placeholder.info("Session is paused. Resume to see the live feed.")
+    st.info("Session is paused. Resume to see the live feed.")
+elif status_value == "error":
+    st.error("Could not connect to the backend. Please ensure the Flask server is running.")

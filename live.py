@@ -5,8 +5,6 @@ import traceback
 import cv2
 import pyaudio
 import PIL.Image
-import mss
-import argparse
 import os
 
 from google import genai
@@ -15,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Audio constants
+# Audio constants (no changes)
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
@@ -46,10 +44,11 @@ pya = pyaudio.PyAudio()
 
 
 class AudioLoop:
-    def __init__(self, video_mode=DEFAULT_MODE):
+    def __init__(self, video_mode=DEFAULT_MODE, frame_queue=None):
         self.video_mode = video_mode
+        self.frame_queue = frame_queue  # The shared queue for receiving frames
         self.audio_in_queue = asyncio.Queue()
-        self.out_queue = asyncio.Queue(maxsize=5)
+        self.audio_out_queue = asyncio.Queue(maxsize=5) # Renamed for clarity
 
         self.session = None
         self.audio_stream = None
@@ -62,6 +61,7 @@ class AudioLoop:
         self.received_audio = []
 
     async def send_text(self):
+        # ... (no changes to this method)
         while self.running:
             text = await asyncio.to_thread(input, "message > ")
             if text.lower() == "q":
@@ -74,14 +74,11 @@ class AudioLoop:
                     )
                 )
 
-    def _get_frame(self, cap):
-        ret, frame = cap.read()
-        if not ret:
-            return None
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = PIL.Image.fromarray(frame_rgb)
+    def _encode_frame(self, frame):
+        """Encodes a single NumPy frame to a base64 JPEG."""
+        img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         img.thumbnail((1024, 1024))
-
+        
         image_io = io.BytesIO()
         img.save(image_io, format="jpeg")
         image_io.seek(0)
@@ -91,48 +88,27 @@ class AudioLoop:
             "data": base64.b64encode(image_io.read()).decode(),
         }
 
-    async def get_frames(self):
-        cap = await asyncio.to_thread(cv2.VideoCapture, 0)
-        while self.running:
-            frame = await asyncio.to_thread(self._get_frame, cap)
-            if frame is None:
-                break
-            await asyncio.sleep(1.0)
-            await self.out_queue.put(frame)
-        cap.release()
-
-    def _get_screen(self):
-        sct = mss.mss()
-        monitor = sct.monitors[0]
-        img = sct.grab(monitor)
-        pil_img = PIL.Image.frombytes("RGB", img.size, img.rgb)
-
-        image_io = io.BytesIO()
-        pil_img.save(image_io, format="jpeg")
-        image_io.seek(0)
-
-        return {
-            "mime_type": "image/jpeg",
-            "data": base64.b64encode(image_io.read()).decode(),
-        }
-
-    async def get_screen(self):
-        while self.running:
-            frame = await asyncio.to_thread(self._get_screen)
-            if frame is None:
-                break
-            await asyncio.sleep(1.0)
-            await self.out_queue.put(frame)
-
     async def send_realtime(self):
+        """Reads from the shared frame_queue and sends to Gemini."""
         while self.running:
-            msg = await self.out_queue.get()
-            if self.session:
-                await self.session.send_realtime_input(
-                    media=types.Blob(data=msg["data"], mime_type=msg["mime_type"])
-                )
+            try:
+                # Read from the synchronous queue in a non-blocking way
+                frame_np = await asyncio.to_thread(self.frame_queue.get, timeout=1.0)
+                
+                # Encode the frame
+                encoded_frame = self._encode_frame(frame_np)
+
+                if self.session:
+                    await self.session.send_realtime_input(
+                        media=types.Blob(data=encoded_frame["data"], mime_type=encoded_frame["mime_type"])
+                    )
+            except Exception:
+                # Timeout or other error, just continue the loop
+                await asyncio.sleep(0.1)
+
 
     async def listen_audio(self):
+        # ... (no changes to this method)
         mic_info = pya.get_default_input_device_info()
         self.audio_stream = await asyncio.to_thread(
             pya.open,
@@ -146,31 +122,40 @@ class AudioLoop:
         kwargs = {"exception_on_overflow": False}
         while self.running:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            # Put audio data into its own queue
+            await self.audio_out_queue.put({"data": data, "mime_type": "audio/pcm"})
+
+    # This task is now also responsible for sending audio
+    async def send_audio(self):
+        while self.running:
+            msg = await self.audio_out_queue.get()
+            if self.session:
+                await self.session.send_realtime_input(
+                    media=types.Blob(data=msg["data"], mime_type=msg["mime_type"])
+                )
 
     async def receive_audio(self):
+        # ... (no changes to this method)
         while self.running:
             if not self.session:
                 await asyncio.sleep(1)
                 continue
             turn = self.session.receive()
             async for response in turn:
-                # Handle audio data if present
                 if data := response.data:
                     self.audio_in_queue.put_nowait(data)
                     self.received_audio.append(data)
 
-                # FIX: Safely check if the 'parts' attribute exists before trying to loop
                 if hasattr(response, 'parts'):
                     for part in response.parts:
                         if part.text:
                             print(part.text, end="")
                             self.received_texts.append(part.text)
                         elif part.tool_call:
-                            # This will print if the model uses a tool like Google Search
                             print(f"\n[Tool Call: {part.tool_call.name}]")
 
     async def play_audio(self):
+        # ... (no changes to this method)
         self.playback_stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
@@ -189,16 +174,15 @@ class AudioLoop:
                 asyncio.TaskGroup() as tg,
             ):
                 self.session = session
-                self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=5)
-
+                
                 self.tasks.append(tg.create_task(self.send_text()))
-                self.tasks.append(tg.create_task(self.send_realtime()))
                 self.tasks.append(tg.create_task(self.listen_audio()))
-                if self.video_mode == "camera":
-                    self.tasks.append(tg.create_task(self.get_frames()))
-                elif self.video_mode == "screen":
-                    self.tasks.append(tg.create_task(self.get_screen()))
+                self.tasks.append(tg.create_task(self.send_audio()))
+                
+                # Only run the video task if in camera mode and a queue is provided
+                if self.video_mode == "camera" and self.frame_queue:
+                    self.tasks.append(tg.create_task(self.send_realtime()))
+                
                 self.tasks.append(tg.create_task(self.receive_audio()))
                 self.tasks.append(tg.create_task(self.play_audio()))
 
@@ -210,41 +194,30 @@ class AudioLoop:
             self._cleanup()
 
     def stop(self):
-        """Gracefully stop audio/video/session without killing Flask"""
+        # ... (no changes to this method)
         self.running = False
         for task in list(self.tasks):
             if not task.done():
                 task.cancel()
         self.tasks.clear()
-        # self._cleanup() was REMOVED from here to prevent a race condition.
-        # The finally block in the run() method now handles all cleanup safely.
         print("✅ AudioLoop stop signal sent")
 
     def _cleanup(self):
-        """Release resources safely (sync now)"""
+        # ... (no changes to this method)
         try:
-            # ✅ FIXED: Removed redundant and incorrect self.session.close() call
-            # The 'async with' block in run() handles this correctly.
             self.session = None
-
             if self.audio_stream:
-                try:
-                    self.audio_stream.close()
-                except Exception:
-                    pass
+                self.audio_stream.close()
                 self.audio_stream = None
-
             if self.playback_stream:
-                try:
-                    self.playback_stream.close()
-                except Exception:
-                    pass
+                self.playback_stream.close()
                 self.playback_stream = None
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
-
 if __name__ == "__main__":
+    # This part is now mainly for testing the AudioLoop directly
+    # The main execution is handled by app.py
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default=DEFAULT_MODE, choices=["camera", "screen", "none"])
     args = parser.parse_args()

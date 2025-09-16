@@ -1,8 +1,21 @@
+# Core Gemini and Google Cloud
 google-genai
-opencv-python #open cv- computer vision
-pyaudio
-pillow
-mss
+python-dotenv
+
+# Web Server & API
+Flask
+requests
+
+# Streamlit Frontend
 streamlit
 streamlit-webrtc
-python-dotenv
+PyAV
+
+# Media Processing
+opencv-python
+pyaudio
+pillow
+numpy
+
+# Screen Capture
+mss
